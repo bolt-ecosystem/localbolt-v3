@@ -14,17 +14,17 @@
 
 [[redirects]]
   from = "/download/macos/apple-silicon"
-  to = "https://github.com/bolt-ecosystem/localbolt-native/releases/download/localbolt-app-v2.0.2/LocalBolt-2.0.2-arm64.dmg"
+  to = "https://github.com/bolt-ecosystem/localbolt-native/releases/download/localbolt-app-v2.0.3/LocalBolt-2.0.3-arm64.dmg"
   status = 302
 
 [[redirects]]
   from = "/download/macos/intel"
-  to = "https://github.com/bolt-ecosystem/localbolt-native/releases/download/localbolt-app-v2.0.2/LocalBolt-2.0.2-x86_64.dmg"
+  to = "https://github.com/bolt-ecosystem/localbolt-native/releases/download/localbolt-app-v2.0.3/LocalBolt-2.0.3-x86_64.dmg"
   status = 302
 
 [[redirects]]
   from = "/download/macos"
-  to = "https://github.com/bolt-ecosystem/localbolt-native/releases/download/localbolt-app-v2.0.2/LocalBolt-2.0.2-arm64.dmg"
+  to = "https://github.com/bolt-ecosystem/localbolt-native/releases/download/localbolt-app-v2.0.3/LocalBolt-2.0.3-arm64.dmg"
   status = 302
 
 [[redirects]]
