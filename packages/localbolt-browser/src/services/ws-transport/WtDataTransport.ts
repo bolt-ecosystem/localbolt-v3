@@ -16,7 +16,8 @@
  *   [WT_FRAMING]    - frame-level events
  */
 
-import { generateEphemeralKeyPair, toBase64, fromBase64, openBoxPayload, isValidWireErrorCode, scalarMult, BtrMode } from '@the9ines/bolt-core';
+import { generateEphemeralKeyPair, fromBase64, openBoxPayload, isValidWireErrorCode, scalarMult, BtrMode } from '@the9ines/bolt-core';
+import { encodeSessionPublicKey } from './sessionKey.js';
 import type { BtrModeValue } from '@the9ines/bolt-core';
 import { ConnectionError, TransferError } from '../../types/webrtc-errors.js';
 import type { WebRTCError } from '../../types/webrtc-errors.js';
@@ -320,11 +321,14 @@ export class WtDataTransport {
           resolve(true);
         };
 
-        // Send our session-key (same protocol as WS transport)
+        // Send our session-key (same protocol as WS transport).
+        // Encode a copied 32-byte key. toBase64() would base64 a 3-element
+        // array-like (the raw wasm-bindgen keypair tuple) into a frame the
+        // daemon rejects as "public key length 3 != 32".
         if (this.keyPair) {
           const sessionKeyMsg = JSON.stringify({
             type: 'session-key',
-            publicKey: toBase64(this.keyPair.publicKey),
+            publicKey: encodeSessionPublicKey(this.keyPair.publicKey),
           });
           this.bridge.send(sessionKeyMsg);
           console.log('[WT_TRANSPORT] Sent session-key');
