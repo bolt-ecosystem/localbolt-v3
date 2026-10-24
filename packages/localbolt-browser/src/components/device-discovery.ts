@@ -98,7 +98,7 @@ function renderDeviceList(
 
 // ── State C: Awaiting approval ───────────────────────────────────────────
 
-function renderAwaitingApproval(deviceName: string, onCancel: () => void, phase: 'requesting' | 'establishing' | 'slow'): HTMLElement {
+function renderAwaitingApproval(deviceName: string, onCancel: () => void, phase: 'requesting' | 'establishing' | 'slow' | 'local-network'): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'flex flex-col items-center gap-3 py-4 animate-fade-in';
 
@@ -114,6 +114,10 @@ function renderAwaitingApproval(deviceName: string, onCancel: () => void, phase:
       // RU3: intermediate timeout feedback - still trying, not failed yet
       statusText = `Still connecting to <span class="text-neon">${escapeHTML(deviceName)}</span>...`;
       helpText = 'This is taking longer than usual - the other device may be slow to respond';
+      break;
+    case 'local-network':
+      statusText = `Chrome needs permission to reach <span class="text-neon">${escapeHTML(deviceName)}</span>`;
+      helpText = 'Allow local network access to start the secure connection';
       break;
     default:
       statusText = `Waiting for <span class="text-neon">${escapeHTML(deviceName)}</span> to accept...`;

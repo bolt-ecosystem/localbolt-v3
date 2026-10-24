@@ -15,6 +15,7 @@ export function showToast(
   title: string,
   description?: string,
   variant: 'default' | 'destructive' = 'default',
+  durationMs = 2000,
 ) {
   const toast = document.createElement('div');
   toast.className = `
@@ -37,5 +38,5 @@ export function showToast(
     toast.style.opacity = '0';
     toast.style.transform = 'translateY(8px)';
     setTimeout(() => toast.remove(), 300);
-  }, 2000);
+  }, durationMs);
 }

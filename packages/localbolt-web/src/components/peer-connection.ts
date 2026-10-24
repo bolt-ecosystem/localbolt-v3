@@ -12,6 +12,13 @@ import type { TransferProgress, SignalMessage, VerificationInfo } from '@the9ine
 import { initIdentity } from '@/services/identity';
 import { isLocalEndpointUrl, endpointScheme } from '@/lib/local-endpoint';
 import {
+  isLocalNetworkAccessFailure,
+  lnaPermissionForDirectDial,
+  resolveLnaState,
+  watchLnaPermission,
+} from '@/lib/local-network-access';
+import type { LnaPermissionName, LnaPermissionState } from '@/lib/local-network-access';
+import {
   setVerificationState, getVerificationState, isTransferAllowed,
   getPhase, getGeneration, isCurrentGeneration,
   beginRequest, receiveRequest, beginConnecting,
@@ -55,6 +62,346 @@ function canUseSecureDirect(wtUrl: string | null, certHash: string | null): bool
   if (endpointScheme(wtUrl) !== 'https:') return false;
   if (typeof globalThis.WebTransport === 'undefined') return false;
   return true;
+}
+
+/**
+ * Chrome LNA gate for the secure-direct dial. This does not relax
+ * canUseSecureDirect or the mixed-content rule in canUseDirectWs.
+ *
+ * A public HTTPS page dialing a private wtUrl needs a Local Network Access
+ * grant. The browser prompt is only reliable from a user gesture, and the
+ * connection_accepted handler is a signaling callback, so an ungranted
+ * permission waits on an in-page button instead of failing opaquely into
+ * WebRTC (a native peer cannot answer that).
+ */
+const WT_CONNECT_TIMEOUT_MS = 10_000;
+/** Long enough for the user to answer Chrome's permission bubble. */
+const WT_LNA_PROMPT_TIMEOUT_MS = 60_000;
+
+interface SecureDirectAttempt {
+  peerCode: string;
+  wtUrl: string;
+  certHash: string;
+  gen: number;
+  permission: LnaPermissionName | null;
+  slowTimer?: ReturnType<typeof setTimeout> | null;
+}
+
+let pendingSecureDirect: SecureDirectAttempt | null = null;
+let unwatchLna: (() => void) | null = null;
+let secureDirectSettled = false;
+/** Bumped when a dial is replaced or abandoned, so a late connect() result is ignored. */
+let secureDirectEpoch = 0;
+const lnaStateCache = new Map<LnaPermissionName, LnaPermissionState>();
+
+interface LnaNotice {
+  root: HTMLElement;
+  title: HTMLElement;
+  body: HTMLElement;
+  allow: HTMLButtonElement;
+}
+
+let lnaNotice: LnaNotice | null = null;
+
+function prefetchLna(wtUrl: string | null): void {
+  if (!wtUrl) return;
+  const permission = lnaPermissionForDirectDial(wtUrl, window.location.href);
+  if (!permission || lnaStateCache.has(permission)) return;
+  void resolveLnaState(permission).then((state) => {
+    lnaStateCache.set(permission, state);
+  });
+}
+
+function stopWatchingLna(): void {
+  unwatchLna?.();
+  unwatchLna = null;
+}
+
+function setLnaNotice(mode: 'hidden' | 'prompt' | 'waiting' | 'blocked'): void {
+  if (!lnaNotice) return;
+  const { root, title, body, allow } = lnaNotice;
+  root.dataset.lnaStatus = mode;
+  if (mode === 'hidden') {
+    root.hidden = true;
+    allow.hidden = true;
+    return;
+  }
+
+  const site = window.location.host || 'this site';
+  root.hidden = false;
+  if (mode === 'prompt') {
+    title.textContent = 'Allow local network access';
+    body.textContent =
+      `Chrome blocks ${site} from opening a direct connection to a device on your network until you allow it. ` +
+      'Click the button, then choose Allow if Chrome asks. If no prompt appears, click the lock icon in the address bar, ' +
+      'open Site settings, set Local network access to Allow, and click the button again.';
+    allow.hidden = false;
+    allow.disabled = false;
+    allow.textContent = 'Allow local network access';
+    return;
+  }
+  if (mode === 'waiting') {
+    title.textContent = 'Waiting for Chrome to allow local network access';
+    body.textContent =
+      'Choose Allow on the Chrome prompt. If you do not see one, click the lock icon in the address bar, ' +
+      'open Site settings, set Local network access to Allow, and try connecting again.';
+    allow.hidden = true;
+    return;
+  }
+  title.textContent = 'Local network access is blocked';
+  body.textContent =
+    `Chrome blocked ${site} from reaching a device on your network. ` +
+    'Click the lock icon in the address bar, open Site settings, set Local network access to Allow, then try connecting again.';
+  allow.hidden = true;
+}
+
+function abortWt(): void {
+  const wt = wtTransportRef;
+  if (!wt) return;
+  // Clear the ref first so the transport's onDisconnect does not re-enter disconnect().
+  wtTransportRef = null;
+  wt.disconnect();
+}
+
+function presentLnaBlocked(): void {
+  secureDirectEpoch++;
+  stopWatchingLna();
+  pendingSecureDirect = null;
+  secureDirectSettled = true;
+  abortWt();
+  store.setState({ connectingTo: null, connectingPhase: null });
+  resetSession();
+  setLnaNotice('blocked');
+  showToast(
+    'Local network access blocked',
+    'Click the lock icon, open Site settings, set Local network access to Allow, then try again.',
+    'destructive',
+    8000,
+  );
+  console.log('[LNA] Local network access is not granted; not falling back to WebRTC');
+}
+
+function failSecureDirect(): void {
+  secureDirectEpoch++;
+  stopWatchingLna();
+  pendingSecureDirect = null;
+  secureDirectSettled = true;
+  abortWt();
+  store.setState({ connectingTo: null, connectingPhase: null });
+  setLnaNotice('hidden');
+  showToast(
+    'Connection Failed',
+    'Unable to reach the desktop app. Check that it is open and both devices are on the same network.',
+    'destructive',
+    8000,
+  );
+  resetSession();
+}
+
+function armLnaWatch(permission: LnaPermissionName, gen: number): void {
+  stopWatchingLna();
+  void watchLnaPermission(permission, (state) => {
+    lnaStateCache.set(permission, state);
+    if (!isCurrentGeneration(gen) || secureDirectSettled) return;
+    if (state === 'denied') {
+      presentLnaBlocked();
+      return;
+    }
+    // Granted from site settings while the in-page prompt is up. No browser
+    // prompt is required anymore, so the dial can start without a gesture.
+    if (state === 'granted' && pendingSecureDirect && !wtTransportRef) {
+      const pending = pendingSecureDirect;
+      setLnaNotice('waiting');
+      store.setState({ connectingPhase: 'local-network' });
+      startSecureDirect({ ...pending, permission, connectTimeout: WT_CONNECT_TIMEOUT_MS });
+    }
+  }).then((stop) => {
+    if (!isCurrentGeneration(gen) || secureDirectSettled) {
+      stop();
+      return;
+    }
+    unwatchLna = stop;
+  });
+}
+
+function presentLnaPrompt(attempt: SecureDirectAttempt & { permission: LnaPermissionName }): void {
+  if (attempt.slowTimer) clearTimeout(attempt.slowTimer);
+  pendingSecureDirect = { ...attempt, slowTimer: null };
+  secureDirectSettled = false;
+  store.setState({ connectingPhase: 'local-network' });
+  setLnaNotice('prompt');
+  armLnaWatch(attempt.permission, attempt.gen);
+  showToast(
+    'Allow local network access',
+    'Chrome needs permission to reach this device on your network. Use the button on the page, then choose Allow.',
+    'default',
+    8000,
+  );
+  console.log('[LNA] Waiting for a user gesture before WebTransport to', attempt.wtUrl);
+}
+
+function onAllowLocalNetwork(): void {
+  const pending = pendingSecureDirect;
+  if (!pending || !isCurrentGeneration(pending.gen)) return;
+  const cached = pending.permission ? lnaStateCache.get(pending.permission) : undefined;
+  if (cached === 'denied') {
+    presentLnaBlocked();
+    return;
+  }
+  // This click is the user activation Chrome needs to show the permission prompt.
+  setLnaNotice('waiting');
+  store.setState({ connectingPhase: 'local-network' });
+  startSecureDirect({ ...pending, connectTimeout: WT_LNA_PROMPT_TIMEOUT_MS });
+}
+
+function startSecureDirect(args: SecureDirectAttempt & { connectTimeout: number }): void {
+  if (!isCurrentGeneration(args.gen)) return;
+  const gen = captureGeneration();
+  const epoch = ++secureDirectEpoch;
+  secureDirectSettled = false;
+  pendingSecureDirect = args.permission ? { ...args, gen } : null;
+
+  if (args.permission) armLnaWatch(args.permission, gen);
+
+  const slowTimer = args.slowTimer ?? setTimeout(() => {
+    if (getPhase() === 'connecting' && store.getState().connectingPhase === 'establishing') {
+      store.setState({ connectingPhase: 'slow' });
+    }
+  }, 10000);
+
+  console.log('[SECURE-DIRECT] Using WtDataTransport to', args.wtUrl, 'with cert-hash pinning');
+  abortWt();
+  wtTransportRef = new WtDataTransport({
+    daemonUrl: args.wtUrl,
+    certHashHex: args.certHash,
+    connectTimeout: args.connectTimeout,
+    identityPublicKey: identityRef?.publicKey,
+    onVerification: handleVerificationState,
+    onReceiveFile: handleFileReceive,
+    onProgress: handleReceiveProgress,
+    onError: handleConnectionError,
+    onDisconnect: () => {
+      if (!wtTransportRef) return;
+      console.log('[SECURE-DIRECT] WT transport disconnected by peer');
+      disconnect();
+    },
+    btrEnabled: true,
+  });
+
+  const transport = wtTransportRef;
+  const dialIsCurrent = () => epoch === secureDirectEpoch && !secureDirectSettled && isCurrentGeneration(gen);
+  void transport.connect().then(async (ok) => {
+    if (!dialIsCurrent()) return;
+    clearTimeout(slowTimer);
+    if (ok) {
+      secureDirectSettled = true;
+      pendingSecureDirect = null;
+      stopWatchingLna();
+      setLnaNotice('hidden');
+      markConnected();
+      setDirectTransportRef(transport as any);
+      const { peers } = store.getState();
+      const connDevice = peers.find((p) => p.peerCode === args.peerCode) || null;
+      store.setState({
+        isConnected: true,
+        connectedDevice: connDevice,
+        connectingTo: null,
+        connectingPhase: null,
+        incomingRequest: null,
+        showDeviceList: false,
+      });
+      return;
+    }
+
+    const failure = transport.connectFailure;
+    if (args.permission && isLocalNetworkAccessFailure(failure)) {
+      clearTimeout(slowTimer);
+      presentLnaBlocked();
+      return;
+    }
+    if (!args.permission) {
+      clearTimeout(slowTimer);
+      failSecureDirect();
+      return;
+    }
+    const state = await resolveLnaState(args.permission);
+    if (!dialIsCurrent()) return;
+    lnaStateCache.set(args.permission, state);
+    if (state === 'denied' || state === 'prompt') {
+      presentLnaBlocked();
+      return;
+    }
+    failSecureDirect();
+  }).catch(() => {
+    if (!dialIsCurrent()) return;
+    clearTimeout(slowTimer);
+    failSecureDirect();
+  });
+}
+
+function routeSecureDirect(args: {
+  peerCode: string;
+  wtUrl: string;
+  certHash: string;
+  gen: number;
+  slowTimer?: ReturnType<typeof setTimeout> | null;
+  userGesture: boolean;
+}): void {
+  const permission = lnaPermissionForDirectDial(args.wtUrl, window.location.href);
+  if (!permission) {
+    startSecureDirect({
+      ...args,
+      permission: null,
+      connectTimeout: WT_CONNECT_TIMEOUT_MS,
+    });
+    return;
+  }
+
+  // Browsers without the Permissions API are not enforcing LNA. Decide that
+  // synchronously so the dial is not deferred behind a microtask.
+  if (!lnaStateCache.has(permission) && !navigator.permissions?.query) {
+    lnaStateCache.set(permission, 'unsupported');
+  }
+
+  const cached = lnaStateCache.get(permission);
+  if (cached === 'granted' || cached === 'unsupported') {
+    startSecureDirect({ ...args, permission, connectTimeout: WT_CONNECT_TIMEOUT_MS });
+    return;
+  }
+
+  // Accept is a click. Dial inside it so Chrome can show the permission
+  // prompt; a cached "denied" may be stale if the user just changed settings.
+  if (args.userGesture) {
+    if (args.slowTimer) clearTimeout(args.slowTimer);
+    setLnaNotice('waiting');
+    store.setState({ connectingPhase: 'local-network' });
+    startSecureDirect({ ...args, permission, connectTimeout: WT_LNA_PROMPT_TIMEOUT_MS });
+    if (cached !== 'prompt') {
+      void resolveLnaState(permission).then((state) => {
+        lnaStateCache.set(permission, state);
+        if (!isCurrentGeneration(args.gen) || secureDirectSettled) return;
+        if (state === 'denied') presentLnaBlocked();
+      });
+    }
+    return;
+  }
+
+  if (cached === 'denied') {
+    if (args.slowTimer) clearTimeout(args.slowTimer);
+    presentLnaBlocked();
+    return;
+  }
+  if (cached === 'prompt') {
+    presentLnaPrompt({ ...args, permission });
+    return;
+  }
+
+  if (args.slowTimer) clearTimeout(args.slowTimer);
+  void resolveLnaState(permission).then((state) => {
+    lnaStateCache.set(permission, state);
+    if (!isCurrentGeneration(args.gen)) return;
+    routeSecureDirect({ ...args, slowTimer: null, userGesture: false });
+  });
 }
 
 /** Generation captured when the current connection attempt began.
@@ -335,6 +682,9 @@ function handleApprovalSignal(signal: SignalMessage) {
       pendingDesktopWsUrl = signal.data.wsUrl || null;
       pendingDesktopWtUrl = signal.data.wtUrl || null;
       pendingDesktopCertHash = signal.data.certHash || null;
+      // Resolve LNA before the user clicks Accept so that click can dial
+      // synchronously and keep its user activation.
+      prefetchLna(pendingDesktopWtUrl);
       if (pendingDesktopWtUrl && pendingDesktopCertHash) {
         console.log('[APPROVAL] Desktop peer provides wtUrl:', pendingDesktopWtUrl, 'certHash:', pendingDesktopCertHash.slice(0, 16) + '...');
       }
@@ -372,10 +722,12 @@ function handleApprovalSignal(signal: SignalMessage) {
 
       // Transition session to connecting
       beginConnecting(signal.from);
+      setLnaNotice('hidden');
       store.setState({ connectingPhase: 'establishing' });
 
       const slowTimer = setTimeout(() => {
-        if (getPhase() === 'connecting') {
+        // Leave the local-network panel in place while Chrome's prompt is up.
+        if (getPhase() === 'connecting' && store.getState().connectingPhase === 'establishing') {
           store.setState({ connectingPhase: 'slow' });
         }
       }, 10000);
@@ -433,65 +785,16 @@ function handleApprovalSignal(signal: SignalMessage) {
       }
 
       if (canUseSecureDirect(desktopWtUrl ?? null, desktopCertHash ?? null)) {
-        // Path 2: Secure direct via WebTransport with cert-hash pinning (HTTPS origins)
-        console.log('[SECURE-DIRECT] Using WtDataTransport to', desktopWtUrl, 'with cert-hash pinning');
-        const gen = captureGeneration();
-
-        wtTransportRef = new WtDataTransport({
-          daemonUrl: desktopWtUrl!,
-          certHashHex: desktopCertHash!,
-          connectTimeout: 10000,
-          identityPublicKey: identityRef?.publicKey,
-          onVerification: handleVerificationState,
-          onReceiveFile: handleFileReceive,
-          onProgress: handleReceiveProgress,
-          onError: handleConnectionError,
-          onDisconnect: () => {
-            if (!wtTransportRef) return; // already cleaned up
-            console.log('[SECURE-DIRECT] WT transport disconnected by peer');
-            disconnect();
-          },
-          btrEnabled: true,
+        // Path 2: Secure direct via WebTransport. LNA is handled inside
+        // routeSecureDirect; a native peer does not get a WebRTC fallback.
+        routeSecureDirect({
+          peerCode: signal.from,
+          wtUrl: desktopWtUrl!,
+          certHash: desktopCertHash!,
+          gen: captureGeneration(),
+          slowTimer,
+          userGesture: false,
         });
-
-        wtTransportRef.connect().then((ok) => {
-          if (!isCurrentGeneration(gen)) return;
-          clearTimeout(slowTimer);
-          if (ok) {
-            markConnected();
-            setDirectTransportRef(wtTransportRef as any); // wire for file upload
-            const { peers } = store.getState();
-            const connDevice = peers.find((p) => p.peerCode === signal.from) || null;
-            store.setState({
-              isConnected: true,
-              connectedDevice: connDevice,
-              connectingTo: null,
-              connectingPhase: null,
-              incomingRequest: null,
-              showDeviceList: false,
-            });
-          } else {
-            console.log('[SECURE-DIRECT] WT connect failed, falling back to WebRTC');
-            store.setState({ connectingTo: null, connectingPhase: null });
-            // Fall back to WebRTC
-            const rtcService = createFreshRtcService();
-            if (rtcService) {
-              rtcService.connect(signal.from).catch(() => {
-                if (!isCurrentGeneration(gen)) return;
-                store.setState({ connectingTo: null, connectingPhase: null });
-                showToast('Connection Failed', 'Unable to connect. Please try again.', 'destructive');
-                resetSession();
-              });
-            }
-          }
-        }).catch(() => {
-          if (!isCurrentGeneration(gen)) return;
-          clearTimeout(slowTimer);
-          console.log('[SECURE-DIRECT] WT connect error, falling back to WebRTC');
-          store.setState({ connectingTo: null, connectingPhase: null });
-          resetSession();
-        });
-
         break;
       }
 
@@ -537,6 +840,7 @@ function selectPeer(peerCode: string) {
 
   // Use session phase guard instead of just isConnected
   if (!beginRequest(peerCode)) return;
+  setLnaNotice('hidden');
 
   const localDeviceName = getDeviceName();
   const localDeviceType = detectDeviceType();
@@ -574,6 +878,7 @@ function acceptRequest() {
   pendingDesktopCertHash = null;
 
   signalingRef.sendSignal('connection_accepted', {}, incomingRequest.peerCode);
+  setLnaNotice('hidden');
   store.setState({ incomingRequest: null, connectingTo: incomingRequest.peerCode, connectingPhase: 'establishing' });
 
   if (wsUrl && canUseDirectWs(wsUrl)) {
@@ -611,49 +916,14 @@ function acceptRequest() {
       resetSession();
     });
   } else if (canUseSecureDirect(wtUrl, certHash)) {
-    // Path 2: Secure direct via WebTransport (HTTPS origins)
-    console.log('[SECURE-DIRECT] Accepting via WtDataTransport to', wtUrl);
-    const gen = captureGeneration();
-    wtTransportRef = new WtDataTransport({
-      daemonUrl: wtUrl!,
-      certHashHex: certHash!,
-      connectTimeout: 10000,
-      identityPublicKey: identityRef?.publicKey,
-      onVerification: handleVerificationState,
-      onReceiveFile: handleFileReceive,
-      onProgress: handleReceiveProgress,
-      onError: handleConnectionError,
-      onDisconnect: () => {
-        console.log('[SECURE-DIRECT] WT transport disconnected by peer');
-        disconnect();
-      },
-      btrEnabled: true,
-    });
-
-    wtTransportRef.connect().then((ok) => {
-      if (!isCurrentGeneration(gen)) return;
-      if (ok) {
-        markConnected();
-        setDirectTransportRef(wtTransportRef as any); // wire for file upload
-        const { peers } = store.getState();
-        const connDevice = peers.find((p) => p.peerCode === incomingRequest.peerCode) || null;
-        store.setState({
-          isConnected: true,
-          connectedDevice: connDevice,
-          connectingTo: null,
-          connectingPhase: null,
-          showDeviceList: false,
-        });
-      } else {
-        console.log('[SECURE-DIRECT] WT connect failed');
-        store.setState({ connectingTo: null, connectingPhase: null });
-        showToast('Connection Failed', 'Unable to establish secure direct connection.', 'destructive');
-        resetSession();
-      }
-    }).catch(() => {
-      if (!isCurrentGeneration(gen)) return;
-      store.setState({ connectingTo: null, connectingPhase: null });
-      resetSession();
+    // Path 2: Secure direct via WebTransport. Accept is a user gesture, so
+    // routeSecureDirect may dial immediately and let Chrome show its prompt.
+    routeSecureDirect({
+      peerCode: incomingRequest.peerCode,
+      wtUrl: wtUrl!,
+      certHash: certHash!,
+      gen: captureGeneration(),
+      userGesture: true,
     });
   } else {
     // Path 3: Standard browser↔browser WebRTC fallback
@@ -675,13 +945,25 @@ function cancelRequest() {
   if (!connectingTo || !signalingRef) return;
 
   console.log('[APPROVAL] Cancelling request to', connectingTo);
+  secureDirectEpoch++;
+  stopWatchingLna();
+  pendingSecureDirect = null;
+  secureDirectSettled = true;
+  setLnaNotice('hidden');
   signalingRef.sendSignal('connection_declined', { reason: 'cancelled' }, connectingTo);
+  store.setState({ connectingPhase: null });
   resetSession();
 }
 
 function disconnect() {
   // Idempotent - skip if already idle
   if (getPhase() === 'idle') return;
+
+  secureDirectEpoch++;
+  stopWatchingLna();
+  pendingSecureDirect = null;
+  secureDirectSettled = true;
+  setLnaNotice('hidden');
 
   // RECON-XFER-1: detach handler before disconnect to prevent re-entrant
   // callbacks during teardown, then retire the one-shot service
@@ -716,9 +998,37 @@ function disconnect() {
 
 // ── Main Component ───────────────────────────────────────────────────────
 
+function createLnaNotice(): LnaNotice {
+  const root = document.createElement('div');
+  root.className = 'rounded-lg border border-neon/30 bg-neon/5 px-4 py-3 space-y-2';
+  root.dataset.lnaNotice = 'true';
+  root.dataset.lnaStatus = 'hidden';
+  root.hidden = true;
+
+  const title = document.createElement('p');
+  title.className = 'text-sm font-medium text-white';
+  title.dataset.lnaTitle = 'true';
+
+  const body = document.createElement('p');
+  body.className = 'text-xs text-gray-400';
+  body.dataset.lnaBody = 'true';
+
+  const allow = document.createElement('button');
+  allow.type = 'button';
+  allow.className = 'px-4 py-2 rounded-md bg-neon text-black text-sm font-medium hover:bg-neon/90 transition-colors';
+  allow.dataset.lnaAllow = 'true';
+  allow.hidden = true;
+  allow.addEventListener('click', onAllowLocalNetwork);
+
+  root.append(title, body, allow);
+  return { root, title, body, allow };
+}
+
 export function createPeerConnection(): HTMLElement {
   const container = document.createElement('div');
   container.className = 'space-y-4';
+
+  lnaNotice = createLnaNotice();
 
   container.appendChild(createConnectionStatus());
 
@@ -732,6 +1042,7 @@ export function createPeerConnection(): HTMLElement {
     cancelRequest,
   ));
   container.appendChild(touchWrap);
+  container.appendChild(lnaNotice.root);
 
   // ── Verification status UI ──────────────────────────────────────────
   const verificationRow = document.createElement('div');
