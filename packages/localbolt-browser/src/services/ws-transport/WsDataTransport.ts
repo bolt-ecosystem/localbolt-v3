@@ -11,7 +11,8 @@
  * sends and receives frames.
  */
 
-import { generateEphemeralKeyPair, toBase64, fromBase64, openBoxPayload, isValidWireErrorCode, scalarMult, BtrMode } from '@the9ines/bolt-core';
+import { generateEphemeralKeyPair, fromBase64, openBoxPayload, isValidWireErrorCode, scalarMult, BtrMode } from '@the9ines/bolt-core';
+import { encodeSessionPublicKey } from './sessionKey.js';
 import type { BtrModeValue } from '@the9ines/bolt-core';
 import { ConnectionError, TransferError } from '../../types/webrtc-errors.js';
 import type { WebRTCError } from '../../types/webrtc-errors.js';
@@ -178,11 +179,11 @@ export class WsDataTransport {
         // session-key response (handled in handleMessage). Once we have
         // the daemon's session key, initiateHello() is called from there.
         if (this.keyPair && this.ws) {
-          const sessionKeyMsg = JSON.stringify({
-            type: 'session-key',
-            publicKey: toBase64(this.keyPair.publicKey),
-          });
           try {
+            const sessionKeyMsg = JSON.stringify({
+              type: 'session-key',
+              publicKey: encodeSessionPublicKey(this.keyPair.publicKey),
+            });
             this.ws.send(sessionKeyMsg);
             console.log('[WS_TRANSPORT] Sent session-key');
           } catch (e) {

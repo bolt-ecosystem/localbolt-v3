@@ -6,8 +6,9 @@
  * three-tier fallback without real WebTransport connections.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { generateEphemeralKeyPair, toBase64 } from '@the9ines/bolt-core';
+import { generateEphemeralKeyPair, toBase64, fromBase64 } from '@the9ines/bolt-core';
 import { encodeFrame, FrameDeframer, WtDataTransport } from '../services/ws-transport/WtDataTransport.js';
+import { SESSION_PUBLIC_KEY_B64_LEN } from '../services/ws-transport/sessionKey.js';
 import { WsDataTransport } from '../services/ws-transport/WsDataTransport.js';
 import { BrowserAppTransport } from '../services/ws-transport/BrowserAppTransport.js';
 
@@ -325,6 +326,36 @@ describe('WtDataTransport', () => {
     const result = await transport.connect();
     // ready never resolves -> timeout
     expect(result).toBe(false);
+  });
+
+  it('frames a session-key whose publicKey is exactly 32 raw bytes', async () => {
+    installMockWebTransport();
+    const transport = new WtDataTransport({
+      daemonUrl: 'https://192.168.4.25:4433',
+      certHashHex: 'ab'.repeat(32),
+      connectTimeout: 5000,
+    });
+
+    const connectPromise = transport.connect();
+    const publicKey = (transport as any).keyPair.publicKey as Uint8Array;
+    await simulateReadyAndSessionKey();
+    await connectPromise;
+
+    const writer = (transport as any).bridge._writer as MockWriter;
+    expect(writer.written.length).toBeGreaterThan(0);
+    const frame = writer.written[0]!;
+    const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+    const len = view.getUint32(0, false);
+    const json = new TextDecoder().decode(frame.subarray(4, 4 + len));
+    expect(json.length).toBe(len);
+    const msg = JSON.parse(json) as { type: string; publicKey: string };
+    expect(msg.type).toBe('session-key');
+    expect(msg.publicKey.length).toBe(SESSION_PUBLIC_KEY_B64_LEN);
+    const decoded = fromBase64(msg.publicKey);
+    expect(decoded.length).toBe(32);
+    expect(decoded).toEqual(publicKey);
+
+    transport.disconnect();
   });
 
   it('connects in legacy mode when no identity configured', async () => {
