@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#A4E200" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://crumbproof.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' ws: wss: https:; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-5pxLP6j7is/MMBRs4gYpluxkpQRHtMqbIRzutbHraro=' https://crumbproof.com https://www.googletagmanager.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' ws: wss: https:; img-src 'self' data: https://www.googletagmanager.com https://*.googletagmanager.com https://www.google-analytics.com https://*.google-analytics.com; frame-ancestors 'none'; base-uri 'self'" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23A4E200'><path d='M13 10V3L4 14h7v7l9-11h-7z'/></svg>" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
 
@@ -148,6 +148,12 @@
 
     <!-- Crumbproof cookie consent -->
     <script src="https://crumbproof.com/v1/crumbproof.js"></script>
+    <!-- GTM loads only after CrumbProof analytics Accept. The CSP sha256 is this script's exact text, so do not rewrap it. Noscript iframe omitted; it cannot be consent-gated. -->
+    <script type="text/plain" data-cp="analytics">(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+})(window,document,'script','dataLayer','GTM-5WHC4FPB');</script>
   </head>
 
   <body>
