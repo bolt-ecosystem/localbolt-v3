@@ -14,7 +14,7 @@ export interface AppState {
   signalingConnected: boolean;
   connectingTo: string | null;
   /** RU2+RU3: connection phase for UI messaging */
-  connectingPhase: 'requesting' | 'establishing' | 'slow' | null;
+  connectingPhase: 'requesting' | 'establishing' | 'slow' | 'local-network' | null;
   connectedDevice: DiscoveredDevice | null;
   transferProgress: TransferProgress | null;
   files: File[];

@@ -102,3 +102,28 @@ export const isLocalEndpointUrl = (rawUrl: string | null | undefined): boolean =
   // only names that are local by definition rather than trusting resolution.
   return isMdnsHost(bareHost);
 };
+
+export type HostAddressSpace = 'loopback' | 'local' | 'public';
+
+/**
+ * Address space of a hostname, using the same loopback / private / mDNS rules
+ * as isLocalEndpointUrl. This does not admit anything: public names stay
+ * public, and `*.localhost` is classified as loopback for the page only.
+ * isLoopbackHost is unchanged, so isLocalEndpointUrl still rejects those names.
+ */
+export const hostAddressSpace = (hostname: string): HostAddressSpace => {
+  if (!hostname) return 'public';
+
+  const isBracketed = hostname.startsWith('[') && hostname.endsWith(']');
+  const bareHost = isBracketed ? hostname.slice(1, -1) : hostname;
+
+  if (isLoopbackHost(bareHost)) return 'loopback';
+  // RFC 6761: names under .localhost resolve to loopback. The page may be
+  // served from one. Direct-dial admission stays with isLocalEndpointUrl.
+  if (bareHost.endsWith('.localhost') || bareHost.endsWith('.localhost.')) return 'loopback';
+
+  if (isBracketed || bareHost.includes(':')) return isPrivateIP(bareHost) ? 'local' : 'public';
+  if (isIPv4Literal(bareHost)) return isPrivateIP(bareHost) ? 'local' : 'public';
+  if (isMdnsHost(bareHost)) return 'local';
+  return 'public';
+};

@@ -184,6 +184,9 @@ class WtDataTransportBridge implements DataTransport {
 // ─── WtDataTransport ────────────────────────────────────────────────────────
 
 export class WtDataTransport {
+  /** Why the latest connect() attempt failed. Null after a successful connect starts. */
+  connectFailure: unknown = null;
+
   private transport: any | null = null; // WebTransport instance
   private bridge: WtDataTransportBridge;
   private deframer = new FrameDeframer();
@@ -263,14 +266,23 @@ export class WtDataTransport {
     const timeout = this.opts.connectTimeout ?? 5000;
     this.sessionGeneration++;
     this.sessionState = 'connecting';
+    this.connectFailure = null;
     this.keyPair = generateEphemeralKeyPair();
     this.bridge = new WtDataTransportBridge();
 
     return new Promise<boolean>(async (resolve) => {
-      const timer = setTimeout(() => {
-        console.log('[WT_TRANSPORT] Connect timeout');
+      const fail = (reason: unknown) => {
+        // Keep the first cause. Closing the transport wakes `closed`, which
+        // would otherwise replace a timeout or LNA error with "closed".
+        if (this.connectFailure == null) this.connectFailure = reason;
+        clearTimeout(timer);
         this.cleanupTransport();
         resolve(false);
+      };
+
+      const timer = setTimeout(() => {
+        console.log('[WT_TRANSPORT] Connect timeout');
+        fail(new Error('WebTransport connect timeout'));
       }, timeout);
 
       try {
@@ -278,7 +290,7 @@ export class WtDataTransport {
         if (typeof globalThis.WebTransport === 'undefined') {
           clearTimeout(timer);
           console.log('[WT_TRANSPORT] WebTransport not available in this browser');
-          resolve(false);
+          fail(new Error('WebTransport not available'));
           return;
         }
 
@@ -336,23 +348,20 @@ export class WtDataTransport {
           console.log('[WT_TRANSPORT] Transport closed');
           if (this.sessionState !== 'post_hello') {
             clearTimeout(timer);
-            this.cleanupTransport();
-            resolve(false);
+            fail(new Error('WebTransport closed before the session was established'));
           } else {
             this.opts.onDisconnect?.();
           }
-        }).catch(() => {
+        }).catch((e: unknown) => {
           if (this.sessionState !== 'post_hello') {
             clearTimeout(timer);
-            this.cleanupTransport();
-            resolve(false);
+            fail(e instanceof Error ? e : new Error('WebTransport closed'));
           }
         });
       } catch (e) {
         clearTimeout(timer);
         console.log('[WT_TRANSPORT] Connection failed:', e);
-        this.cleanupTransport();
-        resolve(false);
+        fail(e);
       }
     });
   }
