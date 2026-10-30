@@ -1,19 +1,37 @@
+# Security updates only (Evan, 2026-10-30). open-pull-requests-limit: 0 turns
+# off routine version bumps; Dependabot security updates still open, grouped
+# into one pull request per ecosystem, checked weekly.
 version: 2
 updates:
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
+    groups:
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: cargo
     directory: /packages/localbolt-signal
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
+    groups:
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
+    groups:
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
